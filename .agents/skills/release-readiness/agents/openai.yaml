@@ -1,0 +1,4 @@
+interface:
+  display_name: "Release Readiness"
+  short_description: "Audit Kuma Voice before a public release"
+  default_prompt: "Use $release-readiness to prepare Kuma Voice for a public release."

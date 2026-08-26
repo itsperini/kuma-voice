@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fly Deploy Verify"
+  short_description: "Deploy and safely verify the live backend"
+  default_prompt: "Use $fly-deploy-verify to deploy and verify Kuma Voice on Fly.io."

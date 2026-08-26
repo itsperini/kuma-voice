@@ -1,7 +1,7 @@
 # Kuma Voice
 
 <p align="center">
-  <img src="assets/watchos-header-banner.png" alt="Kuma Voice watchOS assistant" width="60%">
+  <img src="assets/watchos-header-banner.png" alt="Kuma Voice watchOS assistant" width="80%">
 </p>
 
 Kuma Voice is a self-hosted, watch-only voice assistant prototype. The Watch

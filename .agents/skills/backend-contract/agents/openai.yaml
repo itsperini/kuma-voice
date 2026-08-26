@@ -1,0 +1,4 @@
+interface:
+  display_name: "Backend Contract"
+  short_description: "Change the backend without breaking clients"
+  default_prompt: "Use $backend-contract to make this backend change safely."

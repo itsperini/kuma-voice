@@ -12,6 +12,12 @@ Notion notes, and Google Calendar access.
 This repository does not include a public backend or any credentials. Run your
 own server and point the Watch app at it.
 
+<p align="center">
+  <a href="https://x.com/itsperini">
+    <img src="https://img.shields.io/badge/%40itsperini-000000?style=for-the-badge&amp;logo=x&amp;logoColor=white" alt="@itsperini on X">
+  </a>
+</p>
+
 ## Project layout
 
 - `watchos/KumaVoice.xcodeproj` — watch-only SwiftUI app

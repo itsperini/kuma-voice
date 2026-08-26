@@ -1,0 +1,5 @@
+// Safe defaults for local development. Local.xcconfig is intentionally ignored by Git.
+KUMA_BACKEND_URL = http:/$()/127.0.0.1:8000
+KUMA_API_TOKEN =
+
+#include? "Local.xcconfig"

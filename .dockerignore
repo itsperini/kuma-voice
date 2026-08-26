@@ -1,0 +1,11 @@
+.git
+.DS_Store
+watchos
+**/.venv
+**/.env
+**/.pytest_cache
+**/__pycache__
+**/*.pyc
+backend/tests
+backend/scripts
+*.md

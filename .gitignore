@@ -10,3 +10,10 @@ backend/.venv/
 backend/.pytest_cache/
 backend/**/__pycache__/
 backend/**/*.pyc
+
+web/node_modules/
+web/.next/
+web/out/
+web/*.tsbuildinfo
+web/.env*
+!web/.env.example

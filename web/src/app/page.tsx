@@ -124,6 +124,24 @@ export default function Home() {
                 </motion.li>
               ))}
             </motion.ul>
+            <motion.div
+              className="watch-native-proof"
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.52, delay: 0.78, ease: easeOut }}
+            >
+              <Image
+                src="/applewatch-screenshot.PNG"
+                alt="Kuma in the watchOS app grid"
+                width={374}
+                height={446}
+                sizes="62px"
+              />
+              <span>
+                <strong>Installed right on your Watch</strong>
+                <small>No companion iPhone app.</small>
+              </span>
+            </motion.div>
           </div>
 
           <motion.div
@@ -173,7 +191,7 @@ export default function Home() {
             </motion.div>
             <Image
               className="watch-banner"
-              src="/watchos-header-banner.png"
+              src="/watchos-header-banner-v3.png"
               alt="Kuma Voice listening and responding on Apple Watch"
               width={1774}
               height={887}
@@ -185,7 +203,9 @@ export default function Home() {
               animate={{ y: [0, -4, 0] }}
               transition={{ duration: 4.8, repeat: Number.POSITIVE_INFINITY, ease: "easeInOut" }}
             >
-              <span className="ping-icon" aria-hidden="true">K</span>
+              <span className="ping-icon" aria-hidden="true">
+                <Image src="/kumavoice-mark.svg" alt="" width={32} height={21} />
+              </span>
               <span>
                 <small>Kuma agent</small>
                 Deployment is ready

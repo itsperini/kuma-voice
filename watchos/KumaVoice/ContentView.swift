@@ -1,5 +1,134 @@
 import SwiftUI
 
+enum DevicePairingState: Equatable {
+    case loading
+    case waiting(code: String, destination: String)
+    case failed(String)
+}
+
+@MainActor
+final class DevicePairingViewModel: ObservableObject {
+    @Published private(set) var isPaired = AppConfiguration.hasAuthorization
+    @Published private(set) var state: DevicePairingState = .loading
+
+    private let client = DevicePairingClient()
+    private var pairingTask: Task<Void, Never>?
+
+    func start() {
+        guard !isPaired, pairingTask == nil else { return }
+        state = .loading
+        pairingTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let authorization = try await client.createAuthorization()
+                state = .waiting(
+                    code: authorization.userCode,
+                    destination: Self.displayDestination(authorization.verificationURI)
+                )
+                let accessToken = try await client.waitForApproval(authorization)
+                try DeviceCredentialStore.save(accessToken)
+                isPaired = true
+            } catch is CancellationError {
+                return
+            } catch {
+                state = .failed(error.localizedDescription)
+            }
+            pairingTask = nil
+        }
+    }
+
+    func retry() {
+        pairingTask?.cancel()
+        pairingTask = nil
+        start()
+    }
+
+    private static func displayDestination(_ value: String) -> String {
+        guard let url = URL(string: value), let host = url.host else {
+            return value
+        }
+        let port = url.port.map { ":\($0)" } ?? ""
+        let path = url.path == "/" ? "" : url.path
+        return "\(host)\(port)\(path)"
+    }
+}
+
+struct DevicePairingView: View {
+    @ObservedObject var viewModel: DevicePairingViewModel
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image("KumaLogo")
+                .resizable()
+                .scaledToFit()
+                .colorMultiply(ChatTheme.warmWhite)
+                .frame(width: 45, height: 38)
+                .accessibilityLabel("Kuma")
+
+            switch viewModel.state {
+            case .loading:
+                Text("Creating your code")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(ChatTheme.warmWhite)
+                ProgressView()
+                    .tint(ChatTheme.ember)
+            case let .waiting(code, destination):
+                Text("Pair with Studio")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(ChatTheme.warmWhite)
+
+                Text(code)
+                    .font(.system(size: 23, weight: .bold, design: .rounded))
+                    .tracking(2)
+                    .foregroundStyle(ChatTheme.ember)
+                    .accessibilityLabel("Pairing code \(code)")
+
+                Text("Enter at")
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                    .foregroundStyle(ChatTheme.secondary)
+
+                Text(destination)
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundStyle(ChatTheme.warmWhite)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.72)
+                    .multilineTextAlignment(.center)
+
+                HStack(spacing: 5) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(ChatTheme.ember)
+                    Text("Waiting for approval")
+                        .font(.system(size: 9, design: .rounded))
+                        .foregroundStyle(ChatTheme.secondary)
+                }
+                .padding(.top, 2)
+            case let .failed(message):
+                Text("Pairing paused")
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(ChatTheme.warmWhite)
+                Text(message)
+                    .font(.system(size: 9, design: .rounded))
+                    .foregroundStyle(ChatTheme.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+                Button("Try again") {
+                    viewModel.retry()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(ChatTheme.clay)
+            }
+        }
+        .padding(.horizontal, 13)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(ChatTheme.background.ignoresSafeArea())
+        .preferredColorScheme(.dark)
+        .task {
+            viewModel.start()
+        }
+    }
+}
+
 private enum ChatTheme {
     static let background = Color.black
     static let night = Color(red: 36.0 / 255.0, green: 24.0 / 255.0, blue: 20.0 / 255.0)

@@ -8,6 +8,17 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
 
 class Settings(BaseSettings):
+    kuma_environment: str = "local"
+    database_url: str = "sqlite+aiosqlite:///./.kuma/kuma.db"
+    kuma_encryption_key: str = ""
+    kuma_encryption_key_file: str = ".kuma/encryption.key"
+    kuma_require_device_auth: bool = False
+    kuma_session_cookie_name: str = "kuma_session"
+    kuma_session_cookie_domain: str = ""
+    kuma_session_cookie_secure: bool = False
+    kuma_session_days: int = 30
+    kuma_pairing_minutes: int = 10
+    kuma_studio_url: str = "http://localhost:3001/studio"
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_stt_model: str = "openai/whisper-large-v3"

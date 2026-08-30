@@ -1,4 +1,6 @@
 .DS_Store
+.env
+.kuma/
 .build/
 DerivedData/
 *.xcuserstate
@@ -6,6 +8,7 @@ xcuserdata/
 watchos/Local.xcconfig
 
 backend/.env
+backend/.kuma/
 backend/.venv/
 backend/.pytest_cache/
 backend/**/__pycache__/

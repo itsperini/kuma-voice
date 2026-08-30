@@ -4,10 +4,11 @@
   <img src="assets/watchos-header-banner.png" alt="Kuma Voice watchOS assistant" width="80%">
 </p>
 
-Kuma Voice is a self-hosted, watch-only voice assistant prototype. The Watch
+Kuma Voice is a watch-only voice assistant with a local-first Studio. The Watch
 streams microphone audio to a FastAPI backend, which keeps provider credentials
-off the device and streams a spoken answer back. Optional tools add web search,
-Notion notes, and Google Calendar access.
+off the device and streams a spoken answer back. The Next.js Studio handles
+accounts, onboarding, Watch pairing, and provider setup. Optional tools add web
+search, Notion notes, and Google Calendar access.
 
 This repository does not include a public backend or any credentials. Run your
 own server and point the Watch app at it.
@@ -23,34 +24,55 @@ own server and point the Watch app at it.
 - `watchos/KumaVoice.xcodeproj` — watch-only SwiftUI app
 - `backend/app` — FastAPI server and provider integrations
 - `backend/tests` — tests that use fakes and do not consume API credits
+- `web` — landing page and authenticated Kuma Studio
+- `compose.yaml` — local Postgres, MinIO, API, and web stack
 
 ## Requirements
 
 - Xcode 16 or later and an Apple Watch simulator or device
-- Python 3.12 or later
-- [uv](https://docs.astral.sh/uv/)
-- An OpenAI API key for the realtime voice flow
+- Docker Desktop for the complete local platform
+- An OpenAI API key entered during Studio onboarding
 
-OpenRouter powers the older REST fallback. Exa, Notion, and Google Calendar are
-optional.
+Python 3.12 and [uv](https://docs.astral.sh/uv/) are only required when running
+the backend outside Docker. OpenRouter powers the older REST fallback. Exa,
+Notion, and Google Calendar are optional.
 
-## Start locally
+## Start the local platform
+
+```sh
+cp .env.example .env
+docker compose up --build
+```
+
+Then open:
+
+- [Kuma Voice](http://localhost:3001) — landing page
+- [Kuma Studio signup](http://localhost:3001/studio/signup) — account and setup
+- [FastAPI documentation](http://localhost:8000/docs) — backend API
+- [MinIO console](http://localhost:9001) — local object storage
+
+Postgres listens on port `5432`, MinIO's S3 endpoint on `9000`, and FastAPI on
+`8000`. MinIO is provisioned for future conversation media but is not used by
+the first onboarding flow yet. The Compose credentials are deliberately simple
+local defaults; change them before sharing the environment.
+
+The first-run flow is:
+
+1. Create an account or sign in with email and password.
+2. Add your name, role, technical comfort, use cases, discovery source, and
+   preferred response length. You can optionally describe what you are most
+   excited to solve. Studio saves these answers together as one complete profile.
+3. Open Kuma on the Watch and enter its six-digit code in Studio.
+4. Add an OpenAI API key. It is encrypted before it is written to Postgres and
+   never enters the Watch app bundle.
+
+Docker persists Postgres, MinIO data, and the locally generated encryption key
+in named volumes. To run only the backend without Docker:
 
 ```sh
 cd backend
 cp .env.example .env
 uv sync
-```
-
-Add at least this value to `backend/.env`:
-
-```dotenv
-OPENAI_API_KEY=your-key-here
-```
-
-Then start the server:
-
-```sh
 uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
@@ -63,8 +85,10 @@ documentation is at [`http://127.0.0.1:8000/docs`](http://127.0.0.1:8000/docs).
 1. Open `watchos/KumaVoice.xcodeproj` in Xcode.
 2. Select the `KumaVoice` target and choose your development team under
    Signing & Capabilities.
-3. Start the backend, select an Apple Watch simulator, and press Run.
-4. Tap the microphone button, or use Double Tap on supported hardware, to start
+3. Start the local platform, select an Apple Watch simulator, and press Run.
+4. Enter the code shown by the Watch at
+   [`localhost:3001/studio`](http://localhost:3001/studio).
+5. Tap the microphone button, or use Double Tap on supported hardware, to start
    and stop a turn.
 
 The checked-in configuration uses `http://127.0.0.1:8000`. For a physical Watch
@@ -74,20 +98,38 @@ or hosted server, create a private local configuration:
 cp watchos/Local.xcconfig.example watchos/Local.xcconfig
 ```
 
-Edit `watchos/Local.xcconfig` with your own HTTPS backend URL. If the backend has
-an API token, put the same value in `KUMA_API_TOKEN`. This file is ignored by
-Git. Local HTTP is allowed for development; remote deployments must use HTTPS.
+Edit `watchos/Local.xcconfig` with a backend URL reachable by the Watch. Leave
+`KUMA_API_TOKEN` empty to use the Studio pairing flow. For the simulator this
+can be your Mac's local address; a physical Watch needs a LAN address or HTTPS
+host. This file is ignored by Git. Local HTTP is allowed for development;
+remote deployments must use HTTPS.
 
 ## Protect an internet-facing backend
 
-`KUMA_API_TOKEN` is optional only for local development. If it is empty, the API
-accepts requests without authentication. Always set a long random value when the
-server is reachable from the internet, then put the same value in the ignored
-Watch configuration described above.
+The Compose stack sets `KUMA_REQUIRE_DEVICE_AUTH=true`, so each paired Watch
+receives its own revocable credential. For the older self-hosted mode,
+`KUMA_API_TOKEN` can still be used as a shared backend gate. If neither device
+authentication nor a shared token is enabled, the API accepts requests without
+authentication and must remain local-only.
 
-The token protects every `/api/v1` HTTP and WebSocket endpoint. `/health`
-remains public but returns only `{"status":"ok"}`. This is lightweight shared-
-secret protection for a personal prototype, not multi-user authentication.
+Authentication protects every `/api/v1` HTTP and WebSocket endpoint. `/health`
+remains public but returns only `{"status":"ok"}`. Email/password Studio auth is
+an intentionally small local implementation; add rate limiting, email
+verification, password recovery, audit events, and managed key rotation before
+exposing it as a production service.
+
+For a hosted setup, provide an explicit `KUMA_ENCRYPTION_KEY` from a secret
+manager rather than relying on the local key file, enable secure cookies, and
+serve the three surfaces as:
+
+- `kumavoice.com` — public Next.js pages
+- `studio.kumavoice.com` — Next.js Studio
+- `api.kumavoice.com` — FastAPI and realtime WebSocket API
+
+Set `NEXT_PUBLIC_STUDIO_ORIGIN=https://studio.kumavoice.com` in Next.js,
+`KUMA_API_INTERNAL_URL=https://api.kumavoice.com` on the Next.js server, and
+`KUMA_STUDIO_URL=https://studio.kumavoice.com` in FastAPI. The Studio already
+supports host-based routing for the dedicated subdomain.
 
 ## Deploy to Fly.io
 
@@ -147,6 +189,14 @@ exposed, rotate it rather than merely deleting it from Git.
 ## API endpoints
 
 - `GET /health` — minimal liveness response
+- `POST /studio/v1/auth/signup` — create a local Studio account
+- `POST /studio/v1/auth/signin` — start an HTTP-only cookie session
+- `GET /studio/v1/bootstrap` — load account state plus a complete profile or `null`
+- `PUT /studio/v1/profile` — atomically create or replace all required onboarding answers
+- `POST /studio/v1/pairings/approve` — bind a Watch code to the account
+- `POST /studio/v1/providers/openai` — encrypt and store an OpenAI key
+- `POST /device/v1/authorizations` — request a Watch pairing code
+- `POST /device/v1/token` — poll for the paired device credential
 - `WS /api/v1/realtime` — realtime PCM voice conversation
 - `POST /api/v1/transcriptions` — audio file to text
 - `POST /api/v1/responses` — messages to assistant text

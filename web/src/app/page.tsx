@@ -6,6 +6,8 @@ import { MotionConfig, motion } from "motion/react";
 import { Brand } from "../components/brand";
 
 const easeOut = [0.22, 1, 0.36, 1] as const;
+const studioOrigin = process.env.NEXT_PUBLIC_STUDIO_ORIGIN?.replace(/\/$/, "");
+const studioSignupHref = studioOrigin ? `${studioOrigin}/signup` : "/studio/signup";
 
 const agentTools = [
   "notify",
@@ -45,7 +47,7 @@ export default function Home() {
           <a href="#mcp">For agents</a>
           <a href="#privacy">Privacy</a>
         </nav>
-        <Link className="nav-cta" href="/dashboard">
+        <Link className="nav-cta" href={studioSignupHref}>
           Private beta <span aria-hidden="true">↗</span>
         </Link>
       </motion.header>
@@ -95,7 +97,7 @@ export default function Home() {
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.6, delay: 0.52, ease: easeOut }}
             >
-              <Link className="button button-primary" href="/dashboard">
+              <Link className="button button-primary" href={studioSignupHref}>
                 Join the private beta <span aria-hidden="true">↗</span>
               </Link>
               <a className="text-link" href="#loop">
@@ -375,7 +377,7 @@ export default function Home() {
             <p className="section-kicker section-kicker-dark">Private beta</p>
             <h2 id="closing-title">Give your agents a direct line to your wrist.</h2>
           </div>
-          <Link className="button button-light" href="/dashboard">
+          <Link className="button button-light" href={studioSignupHref}>
             Request early access <span aria-hidden="true">↗</span>
           </Link>
         </motion.section>

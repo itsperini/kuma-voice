@@ -23,6 +23,7 @@ from websockets.exceptions import ConnectionClosed
 from .calendar import GoogleCalendarClient
 from .config import Settings, get_settings
 from .conversations import ConversationNotFoundError, ConversationStore
+from .database import open_database
 from .exa import ExaClient
 from .notion import NotionClient
 from .openai_realtime import (
@@ -31,6 +32,14 @@ from .openai_realtime import (
     bridge_realtime_session,
 )
 from .openrouter import OpenRouterClient, OpenRouterError
+from .platform import (
+    DevicePrincipal,
+    device_router,
+    load_device_runtime,
+    resolve_device_principal,
+    studio_router,
+)
+from .security import SecretBox
 from .schemas import (
     ChatRequest,
     ChatResponse,
@@ -49,6 +58,11 @@ conversation_store = ConversationStore(settings.kuma_system_prompt)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.settings = settings
+    app.state.secret_box = SecretBox.from_settings(settings)
+    database_engine, database = await open_database(settings)
+    app.state.database_engine = database_engine
+    app.state.database = database
     app.state.openrouter = OpenRouterClient(settings)
     app.state.openai_realtime = OpenAIRealtimeConnector(settings)
     app.state.tools = ToolRegistry(
@@ -60,6 +74,7 @@ async def lifespan(app: FastAPI):
     yield
     await app.state.openrouter.aclose()
     await app.state.tools.aclose()
+    await app.state.database_engine.dispose()
 
 
 app = FastAPI(
@@ -68,12 +83,14 @@ app = FastAPI(
     description="Local voice assistant backend for the Kuma Voice watchOS prototype.",
     lifespan=lifespan,
 )
+app.include_router(studio_router)
+app.include_router(device_router)
 
 
 def api_token_matches(authorization: str | None) -> bool:
     expected = settings.kuma_api_token.strip()
     if not expected:
-        return True
+        return False
     prefix = "Bearer "
     if not authorization or not authorization.startswith(prefix):
         return False
@@ -81,15 +98,43 @@ def api_token_matches(authorization: str | None) -> bool:
     return bool(provided) and hmac.compare_digest(provided, expected)
 
 
+async def authorize_api_request(
+    authorization: str | None,
+    *,
+    touch_device: bool = False,
+) -> tuple[bool, DevicePrincipal | None]:
+    if api_token_matches(authorization):
+        return True, None
+
+    principal = await resolve_device_principal(
+        app.state.database,
+        authorization,
+        touch=touch_device,
+    )
+    if principal is not None:
+        return True, principal
+
+    shared_token_configured = bool(settings.kuma_api_token.strip())
+    if not shared_token_configured and not settings.kuma_require_device_auth:
+        return True, None
+    return False, None
+
+
 @app.middleware("http")
 async def authenticate_api_request(request: Request, call_next):
     path = request.url.path
     is_api_request = path == "/api/v1" or path.startswith("/api/v1/")
-    if is_api_request and not api_token_matches(request.headers.get("authorization")):
-        return JSONResponse(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"detail": "Unauthorized"},
+    if is_api_request:
+        authorized, principal = await authorize_api_request(
+            request.headers.get("authorization"),
+            touch_device=True,
         )
+        if not authorized:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"detail": "Unauthorized"},
+            )
+        request.state.device_principal = principal
     return await call_next(request)
 
 
@@ -126,14 +171,44 @@ async def health() -> HealthResponse:
 
 @app.websocket("/api/v1/realtime")
 async def realtime_voice(websocket: WebSocket) -> None:
-    if not api_token_matches(websocket.headers.get("authorization")):
+    authorized, principal = await authorize_api_request(
+        websocket.headers.get("authorization"),
+        touch_device=True,
+    )
+    if not authorized:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
+
+    connector = websocket.app.state.openai_realtime
+    if principal is not None:
+        runtime = await load_device_runtime(
+            websocket.app.state.database,
+            websocket.app.state.secret_box,
+            principal.user_id,
+        )
+        personalized_prompt = settings.kuma_system_prompt.rstrip()
+        if runtime.full_name:
+            personalized_prompt += f" The user's name is {runtime.full_name}."
+        style_instructions = {
+            "brief": " Prefer short spoken answers.",
+            "balanced": " Give enough spoken context to be useful without rambling.",
+            "detailed": " Give a more complete answer when the request benefits from it.",
+        }
+        personalized_prompt += style_instructions.get(runtime.response_style, "")
+        connector = OpenAIRealtimeConnector(
+            settings.model_copy(
+                update={
+                    "openai_api_key": runtime.openai_api_key or "",
+                    "kuma_system_prompt": personalized_prompt,
+                }
+            )
+        )
+
     await websocket.accept()
     try:
         await bridge_realtime_session(
             websocket,
-            websocket.app.state.openai_realtime,
+            connector,
             settings.kuma_max_audio_bytes,
             tools=getattr(websocket.app.state, "tools", None),
             search=getattr(websocket.app.state, "exa", None),

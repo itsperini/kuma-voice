@@ -1,7 +1,9 @@
 import base64
 import asyncio
 import json
+import sqlite3
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,7 +23,24 @@ from app.openai_realtime import (
     WEB_SEARCH_TOOL,
     OpenAIRealtimeConnector,
 )
+from app.security import SecretBox
 from app.tools import ToolRegistry
+
+
+@pytest.fixture(autouse=True)
+def isolated_platform_storage(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        settings,
+        "database_url",
+        f"sqlite+aiosqlite:///{tmp_path / 'kuma-test.db'}",
+    )
+    monkeypatch.setattr(
+        settings,
+        "kuma_encryption_key_file",
+        str(tmp_path / "encryption.key"),
+    )
+    monkeypatch.setattr(settings, "kuma_environment", "local")
+    monkeypatch.setattr(settings, "kuma_require_device_auth", False)
 
 
 class FakeOpenRouter:
@@ -118,6 +137,165 @@ def test_api_token_protects_http_and_websocket(monkeypatch) -> None:
     assert unauthorized.status_code == 401
     assert authorized.status_code == 201
     assert rejected.value.code == 1008
+
+
+def test_local_account_onboarding_pairing_and_encrypted_key(
+    monkeypatch, tmp_path: Path
+) -> None:
+    api_key = "sk-test-this-is-not-a-real-openai-key"
+
+    with TestClient(app) as client:
+        signup = client.post(
+            "/studio/v1/auth/signup",
+            json={"email": "kuma@example.com", "password": "warm-paws-123"},
+        )
+        assert signup.status_code == 201
+        assert signup.json()["next_step"] == "profile"
+        assert signup.json()["profile"] is None
+        assert "httponly" in signup.headers["set-cookie"].lower()
+
+        duplicate = client.post(
+            "/studio/v1/auth/signup",
+            json={"email": "KUMA@example.com", "password": "warm-paws-123"},
+        )
+        assert duplicate.status_code == 409
+
+        provider_before_profile = client.put(
+            "/studio/v1/providers/openai",
+            json={"api_key": api_key},
+        )
+        assert provider_before_profile.status_code == 409
+
+        incomplete_profile = client.put(
+            "/studio/v1/profile",
+            json={
+                "full_name": "Marco",
+                "role": "Founder",
+                "primary_goal": "Handle everyday tasks without reaching for my phone",
+                "response_style": "brief",
+            },
+        )
+        assert incomplete_profile.status_code == 422
+
+        authorization = client.post(
+            "/device/v1/authorizations",
+            json={"device_name": "Marco's Apple Watch"},
+        )
+        assert authorization.status_code == 201
+        pairing = authorization.json()
+        assert len(pairing["user_code"].replace(" ", "")) == 6
+
+        pending = client.post(
+            "/device/v1/token",
+            json={"device_code": pairing["device_code"]},
+        )
+        assert pending.status_code == 202
+
+        pairing_before_profile = client.post(
+            "/studio/v1/pairings/approve",
+            json={"user_code": pairing["user_code"]},
+        )
+        assert pairing_before_profile.status_code == 409
+
+        profile = client.put(
+            "/studio/v1/profile",
+            json={
+                "full_name": "Marco",
+                "role": "Founder",
+                "use_cases": ["personal-assistant", "workflows-approvals"],
+                "technical_comfort": "tinkerer",
+                "discovery_source": "tiktok",
+                "response_style": "brief",
+            },
+        )
+        assert profile.status_code == 200
+        assert profile.json()["next_step"] == "watch"
+        profile_data = profile.json()["profile"]
+        assert profile_data["use_cases"] == [
+            "personal-assistant",
+            "workflows-approvals",
+        ]
+        assert profile_data["technical_comfort"] == "tinkerer"
+        assert profile_data["discovery_source"] == "tiktok"
+        assert profile_data["primary_goal"] is None
+
+        too_many_use_cases = client.put(
+            "/studio/v1/profile",
+            json={
+                "full_name": "Marco",
+                "role": "Founder",
+                "primary_goal": "Keep the Watch useful",
+                "use_cases": [
+                    "personal-assistant",
+                    "workflows-approvals",
+                    "reminders-planning",
+                    "smart-home",
+                ],
+                "technical_comfort": "everyday",
+                "discovery_source": "instagram",
+                "response_style": "brief",
+            },
+        )
+        assert too_many_use_cases.status_code == 422
+
+        provider_before_watch = client.put(
+            "/studio/v1/providers/openai",
+            json={"api_key": api_key},
+        )
+        assert provider_before_watch.status_code == 409
+
+        approval = client.post(
+            "/studio/v1/pairings/approve",
+            json={"user_code": pairing["user_code"]},
+        )
+        assert approval.status_code == 200
+
+        token_exchange = client.post(
+            "/device/v1/token",
+            json={"device_code": pairing["device_code"]},
+        )
+        assert token_exchange.status_code == 200
+        device_token = token_exchange.json()["access_token"]
+        assert device_token.startswith("kuma_device_")
+
+        monkeypatch.setattr(settings, "kuma_require_device_auth", True)
+        assert client.post("/api/v1/conversations").status_code == 401
+        device_request = client.post(
+            "/api/v1/conversations",
+            headers={"Authorization": f"Bearer {device_token}"},
+        )
+        assert device_request.status_code == 201
+
+        provider = client.put(
+            "/studio/v1/providers/openai",
+            json={"api_key": api_key},
+        )
+        assert provider.status_code == 200
+        assert provider.json()["next_step"] == "complete"
+        assert provider.json()["openai"] == {
+            "configured": True,
+            "last_four": "-key",
+        }
+        assert api_key not in provider.text
+
+        signout = client.post("/studio/v1/auth/signout")
+        assert signout.status_code == 204
+        assert client.get("/studio/v1/bootstrap").status_code == 401
+
+    database = sqlite3.connect(tmp_path / "kuma-test.db")
+    encrypted_key = database.execute(
+        "SELECT encrypted_value FROM provider_secrets WHERE provider = 'openai'"
+    ).fetchone()[0]
+    password_hash = database.execute("SELECT password_hash FROM users").fetchone()[0]
+    stored_device_token = database.execute(
+        "SELECT access_token_hash FROM devices"
+    ).fetchone()[0]
+    database.close()
+
+    assert api_key not in encrypted_key
+    assert "warm-paws-123" not in password_hash
+    assert device_token not in stored_device_token
+    assert SecretBox.from_settings(settings).decrypt(encrypted_key) == api_key
 
 
 def test_full_voice_turn() -> None:

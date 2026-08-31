@@ -4,16 +4,44 @@ import Image from "next/image";
 import Link from "next/link";
 import { MotionConfig, motion } from "motion/react";
 import { Brand } from "../components/brand";
+import { CookieBanner } from "../components/cookie-banner";
 
 const easeOut = [0.22, 1, 0.36, 1] as const;
 const studioOrigin = process.env.NEXT_PUBLIC_STUDIO_ORIGIN?.replace(/\/$/, "");
-const studioSignupHref = studioOrigin ? `${studioOrigin}/signup` : "/studio/signup";
+const studioHref = studioOrigin || "/studio";
+const appStoreHref = process.env.NEXT_PUBLIC_APP_STORE_URL?.trim() || "#app-store";
+const appStoreExternal = appStoreHref.startsWith("http");
 
 const agentTools = [
   "notify",
   "ask",
   "request_confirmation",
   "deliver_result",
+];
+
+const managedUseCases = [
+  {
+    label: "Ask",
+    title: "Get useful answers mid-moment",
+    copy: "Look something up, compare options, or think through a decision while your phone stays away.",
+  },
+  {
+    label: "Do",
+    title: "Move the day forward",
+    copy: "Create a reminder, check what is next, capture a note, or follow up before the thought disappears.",
+  },
+  {
+    label: "Remember",
+    title: "Make help feel personal",
+    copy: "Choose what Kuma should remember, review it in Studio, and remove it whenever it stops being useful.",
+  },
+];
+
+const managedConnectors = [
+  { name: "Calendar", detail: "Plans and availability", mark: "CAL" },
+  { name: "Notion", detail: "Notes and knowledge", mark: "NOT" },
+  { name: "Web", detail: "Fresh information", mark: "WEB" },
+  { name: "More via MCP", detail: "Your tools, when you want them", mark: "MCP" },
 ];
 
 const privacyPrinciples = [
@@ -44,11 +72,12 @@ export default function Home() {
         <Brand short />
         <nav className="desktop-nav" aria-label="Primary navigation">
           <a href="#loop">How it works</a>
+          <a href="#managed">For you</a>
           <a href="#mcp">For agents</a>
           <a href="#privacy">Privacy</a>
         </nav>
-        <Link className="nav-cta" href={studioSignupHref}>
-          Private beta <span aria-hidden="true">↗</span>
+        <Link className="nav-cta" href={studioHref}>
+          Open Studio <span aria-hidden="true">↗</span>
         </Link>
       </motion.header>
 
@@ -88,8 +117,9 @@ export default function Home() {
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.66, delay: 0.42, ease: easeOut }}
             >
-              Speak from Apple Watch. Let your agents reach back with results,
-              questions, and approvals—without a companion iPhone app.
+              Start with a ready-made Kuma agent or connect your own. Speak,
+              get things done, and stay in the loop from Apple Watch—without a
+              companion iPhone app.
             </motion.p>
             <motion.div
               className="hero-actions"
@@ -97,8 +127,8 @@ export default function Home() {
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.6, delay: 0.52, ease: easeOut }}
             >
-              <Link className="button button-primary" href={studioSignupHref}>
-                Join the private beta <span aria-hidden="true">↗</span>
+              <Link className="button button-primary" href={studioHref}>
+                Open Studio <span aria-hidden="true">↗</span>
               </Link>
               <a className="text-link" href="#loop">
                 See the loop <span aria-hidden="true">↓</span>
@@ -114,7 +144,7 @@ export default function Home() {
                 visible: { transition: { delayChildren: 0.62, staggerChildren: 0.08 } },
               }}
             >
-              {["Watch-only", "Built for MCP", "Human in the loop"].map((note) => (
+              {["Watch-only", "Managed agent", "No API key required", "MCP-ready"].map((note) => (
                 <motion.li
                   key={note}
                   variants={{
@@ -126,8 +156,12 @@ export default function Home() {
                 </motion.li>
               ))}
             </motion.ul>
-            <motion.div
+            <motion.a
               className="watch-native-proof"
+              id="app-store"
+              href={appStoreHref}
+              target={appStoreExternal ? "_blank" : undefined}
+              rel={appStoreExternal ? "noreferrer" : undefined}
               initial={{ opacity: 0, y: 12 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.52, delay: 0.78, ease: easeOut }}
@@ -141,9 +175,9 @@ export default function Home() {
               />
               <span>
                 <strong>Installed right on your Watch</strong>
-                <small>No companion iPhone app.</small>
+                <small>{appStoreExternal ? "View Kuma Voice on the App Store ↗" : "App Store release coming soon."}</small>
               </span>
-            </motion.div>
+            </motion.a>
           </div>
 
           <motion.div
@@ -274,6 +308,97 @@ export default function Home() {
         </motion.section>
 
         <motion.section
+          className="managed-section"
+          id="managed"
+          aria-labelledby="managed-title"
+          initial={{ opacity: 0, y: 42 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, amount: 0.12 }}
+          transition={{ duration: 0.76, ease: easeOut }}
+        >
+          <div className="managed-intro">
+            <p className="section-kicker">Kuma, ready out of the box</p>
+            <h2 id="managed-title">No API key. No agent stack. Just ask.</h2>
+            <p>
+              The managed Kuma agent is for people who want the experience, not
+              the setup. Personalize it in Studio, choose the services it can
+              reach, and let Kuma handle the voice pipeline behind the scenes.
+            </p>
+            <div className="managed-included" aria-label="Managed Kuma includes">
+              <span><i aria-hidden="true" /> Managed voice agent</span>
+              <span><i aria-hidden="true" /> Credits included</span>
+              <span><i aria-hidden="true" /> Memory you control</span>
+            </div>
+          </div>
+
+          <motion.div
+            className="managed-agent-card"
+            initial={{ opacity: 0, x: 28, rotate: 1.2 }}
+            whileInView={{ opacity: 1, x: 0, rotate: -0.6 }}
+            viewport={{ once: true, amount: 0.18 }}
+            transition={{ duration: 0.72, delay: 0.14, ease: easeOut }}
+          >
+            <div className="managed-card-topline">
+              <span className="managed-card-brand">
+                <Image src="/kumavoice-mark.svg" alt="" width={34} height={20} />
+                Kuma / personal agent
+              </span>
+              <span className="managed-ready"><i /> Ready</span>
+            </div>
+
+            <div className="managed-conversation">
+              <p className="managed-user-line">“What does my afternoon look like?”</p>
+              <div className="managed-reply">
+                <span className="managed-reply-wave" aria-hidden="true">
+                  {[7, 16, 24, 12, 19, 9].map((height, index) => (
+                    <i key={`${height}-${index}`} style={{ height }} />
+                  ))}
+                </span>
+                <p>You have two meetings. I left 30 minutes free before your train.</p>
+              </div>
+            </div>
+
+            <div className="connector-shelf">
+              <div className="connector-shelf-heading">
+                <span>Connect from Studio</span>
+                <small>You choose the access</small>
+              </div>
+              <div className="connector-list">
+                {managedConnectors.map((connector) => (
+                  <div className="connector-row" key={connector.name}>
+                    <span className="connector-mark">{connector.mark}</span>
+                    <span>
+                      <strong>{connector.name}</strong>
+                      <small>{connector.detail}</small>
+                    </span>
+                    <span aria-hidden="true">＋</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <p className="managed-roadmap-note">
+              Managed Kuma and its connector library are being prepared for launch.
+            </p>
+          </motion.div>
+
+          <div className="managed-usecase-grid">
+            {managedUseCases.map((useCase, index) => (
+              <motion.article
+                key={useCase.label}
+                initial={{ opacity: 0, y: 20 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, amount: 0.5 }}
+                transition={{ duration: 0.5, delay: 0.12 + index * 0.07, ease: easeOut }}
+              >
+                <span>{useCase.label}</span>
+                <h3>{useCase.title}</h3>
+                <p>{useCase.copy}</p>
+              </motion.article>
+            ))}
+          </div>
+        </motion.section>
+
+        <motion.section
           className="mcp-section"
           id="mcp"
           aria-labelledby="mcp-title"
@@ -289,7 +414,7 @@ export default function Home() {
             viewport={{ once: true, amount: 0.5 }}
             transition={{ duration: 0.66, delay: 0.12, ease: easeOut }}
           >
-            <p className="section-kicker section-kicker-dark">For any agent</p>
+            <p className="section-kicker section-kicker-dark">For your own agent</p>
             <h2 id="mcp-title">A Watch your agent can call.</h2>
             <p>
               Kuma binds your Apple Watch to a secure remote MCP endpoint. Your
@@ -374,11 +499,11 @@ export default function Home() {
           transition={{ duration: 0.72, ease: easeOut }}
         >
           <div>
-            <p className="section-kicker section-kicker-dark">Private beta</p>
-            <h2 id="closing-title">Give your agents a direct line to your wrist.</h2>
+            <p className="section-kicker section-kicker-dark">Kuma Studio</p>
+            <h2 id="closing-title">Start with Kuma. Make it yours over time.</h2>
           </div>
-          <Link className="button button-light" href={studioSignupHref}>
-            Request early access <span aria-hidden="true">↗</span>
+          <Link className="button button-light" href={studioHref}>
+            Open Studio <span aria-hidden="true">↗</span>
           </Link>
         </motion.section>
       </main>
@@ -386,10 +511,15 @@ export default function Home() {
       <footer className="site-footer">
         <Brand short />
         <p>Independent Apple Watch software for human-agent collaboration.</p>
-        <a href="https://x.com/kumavoice" target="_blank" rel="noreferrer">
-          @kumavoice <span aria-hidden="true">↗</span>
-        </a>
+        <nav className="site-footer-links" aria-label="Footer navigation">
+          <Link href="/terms">Terms &amp; conditions</Link>
+          <Link href="/privacy">Privacy policy</Link>
+          <a href="https://x.com/kumavoice" target="_blank" rel="noreferrer">
+            @kumavoice <span aria-hidden="true">↗</span>
+          </a>
+        </nav>
       </footer>
+      <CookieBanner />
       </div>
     </MotionConfig>
   );

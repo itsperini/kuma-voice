@@ -14,13 +14,35 @@ enum AppConfiguration {
         return components.url!
     }
 
+    static var directRealtimeSessionURL: URL {
+        backendBaseURL.appendingPathComponent("api/v1/realtime/session")
+    }
+
+    static func realtimeToolURL(named name: String) -> URL {
+        backendBaseURL.appendingPathComponent("api/v1/realtime/tools/\(name)")
+    }
+
     static var configuredAPIToken: String {
         let configured = Bundle.main.object(forInfoDictionaryKey: "KUMA_API_TOKEN") as? String
         return configured?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
+    static var usesConfiguredAPIToken: Bool {
+        let configured = Bundle.main.object(
+            forInfoDictionaryKey: "KUMA_USE_CONFIGURED_API_TOKEN"
+        ) as? String
+        let normalized = configured?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard let normalized else { return true }
+        return !["0", "false", "no"].contains(normalized)
+    }
+
     static var apiToken: String {
-        DeviceCredentialStore.load() ?? configuredAPIToken
+        if let deviceToken = DeviceCredentialStore.load() {
+            return deviceToken
+        }
+        return usesConfiguredAPIToken ? configuredAPIToken : ""
     }
 
     static var hasAuthorization: Bool {
@@ -43,7 +65,13 @@ enum DeviceCredentialError: LocalizedError {
 
 enum DeviceCredentialStore {
     private static let service = "com.kumavoice.device"
-    private static let account = "managed-access-token"
+    private static var account: String {
+        let endpoint = AppConfiguration.backendBaseURL
+        let scheme = endpoint.scheme ?? "unknown"
+        let host = endpoint.host ?? "unknown"
+        let port = endpoint.port.map { ".\($0)" } ?? ""
+        return "managed-access-token.\(scheme).\(host)\(port)"
+    }
 
     static func load() -> String? {
         let query: [String: Any] = [

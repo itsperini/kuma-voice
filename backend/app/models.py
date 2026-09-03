@@ -109,3 +109,75 @@ class ProviderSecret(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class MCPConnection(Base):
+    __tablename__ = "mcp_connections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(80))
+    server_url: Mapped[str] = mapped_column(String(2048))
+    auth_type: Mapped[str] = mapped_column(String(24), default="none")
+    encrypted_credentials: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    last_error: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    oauth_issuer: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    oauth_token_endpoint: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    oauth_resource: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    oauth_scope: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    catalog_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class MCPTool(Base):
+    __tablename__ = "mcp_tools"
+    __table_args__ = (UniqueConstraint("connection_id", "remote_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    connection_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_connections.id", ondelete="CASCADE"), index=True
+    )
+    remote_name: Mapped[str] = mapped_column(String(200))
+    exposed_name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    title: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_schema: Mapped[dict] = mapped_column(JSON, default=dict)
+    enabled: Mapped[bool] = mapped_column(default=False)
+    risk: Mapped[str] = mapped_column(String(16), default="read")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class MCPOAuthFlow(Base):
+    __tablename__ = "mcp_oauth_flows"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    connection_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_connections.id", ondelete="CASCADE"), index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    state_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    encrypted_code_verifier: Mapped[str] = mapped_column(Text)
+    issuer: Mapped[str] = mapped_column(String(2048))
+    issuer_required: Mapped[bool] = mapped_column(default=False)
+    token_endpoint: Mapped[str] = mapped_column(String(2048))
+    client_id: Mapped[str] = mapped_column(String(2048))
+    encrypted_client_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
+    token_endpoint_auth_method: Mapped[str] = mapped_column(String(32), default="none")
+    resource: Mapped[str] = mapped_column(String(2048))
+    scope: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

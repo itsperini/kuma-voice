@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     kuma_session_days: int = 30
     kuma_pairing_minutes: int = 10
     kuma_studio_url: str = "http://localhost:3001/studio"
+    kuma_mcp_oauth_callback_url: str = (
+        "http://localhost:8000/studio/v1/mcp/oauth/callback"
+    )
+    kuma_mcp_client_metadata_url: str = ""
+    kuma_mcp_catalog_seconds: int = 300
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_stt_model: str = "openai/whisper-large-v3"
@@ -27,8 +32,12 @@ class Settings(BaseSettings):
     openrouter_tts_voice: str = "en-US-Harper:MAI-Voice-2"
     openai_api_key: str = ""
     openai_realtime_url: str = "wss://api.openai.com/v1/realtime"
+    openai_realtime_client_secrets_url: str = (
+        "https://api.openai.com/v1/realtime/client_secrets"
+    )
     openai_realtime_model: str = "gpt-realtime-2.1-mini"
     openai_realtime_voice: str = "marin"
+    kuma_direct_realtime: bool = True
     exa_api_key: str = ""
     exact_api_key: str = ""
     notion_api_key: str = ""

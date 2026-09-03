@@ -4,7 +4,10 @@ import json
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -13,6 +16,16 @@ from app.calendar import compact_event, parse_datetime
 from app.config import Settings
 from app.exa import compact_exa_results
 from app.main import app, settings
+from app.mcp_gateway import (
+    MAX_TOOL_RESULT_BYTES,
+    MCPGateway,
+    MCPGatewayError,
+    validate_mcp_destination,
+    validate_mcp_url,
+)
+from app.models import MCPConnection
+from app import mcp_routes
+from mcp.shared.auth import OAuthMetadata, ProtectedResourceMetadata
 from app.notion import blocks_to_text, page_title
 from app.openai_realtime import (
     CALENDAR_CREATE_TOOL,
@@ -22,6 +35,7 @@ from app.openai_realtime import (
     NOTION_SEARCH_TOOL,
     WEB_SEARCH_TOOL,
     OpenAIRealtimeConnector,
+    OpenAIRealtimeSessionIssuer,
 )
 from app.security import SecretBox
 from app.tools import ToolRegistry
@@ -91,6 +105,29 @@ class FakeRealtimeConnector:
         return connection_context()
 
 
+class FakeRealtimeSessionIssuer:
+    def __init__(self) -> None:
+        self.connector: OpenAIRealtimeConnector | None = None
+        self.safety_identifier: str | None = None
+
+    async def issue(
+        self,
+        connector: OpenAIRealtimeConnector,
+        *,
+        safety_identifier: str | None = None,
+    ) -> dict:
+        self.connector = connector
+        self.safety_identifier = safety_identifier
+        return {
+            "value": "ek_test_short_lived",
+            "expires_at": 1_800_000_000,
+            "session_id": "sess_test",
+        }
+
+    async def aclose(self) -> None:
+        return None
+
+
 class FakeExa:
     def __init__(self) -> None:
         self.queries: list[str] = []
@@ -113,6 +150,48 @@ class FakeExa:
         return None
 
 
+class FakeMCPClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    async def list_tools(self, cursor: str | None = None):
+        assert cursor is None
+        return SimpleNamespace(
+            tools=[
+                SimpleNamespace(
+                    name="search_workspace",
+                    title="Search workspace",
+                    description="Search the connected workspace.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                )
+            ],
+            ttl_ms=60_000,
+            next_cursor=None,
+        )
+
+    async def call_tool(self, name: str, arguments: dict):
+        self.calls.append((name, arguments))
+        return SimpleNamespace(
+            structured_content={"matches": ["Launch plan"]},
+            content=[],
+            is_error=False,
+        )
+
+
+class FakeMCPGateway(MCPGateway):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.client = FakeMCPClient()
+
+    @asynccontextmanager
+    async def _client(self, connection):
+        yield self.client
+
+
 def test_health() -> None:
     with TestClient(app) as client:
         response = client.get("/health")
@@ -126,6 +205,11 @@ def test_api_token_protects_http_and_websocket(monkeypatch) -> None:
 
     with TestClient(app) as client:
         unauthorized = client.post("/api/v1/conversations")
+        unauthorized_direct = client.post("/api/v1/realtime/session")
+        unauthorized_tool = client.post(
+            "/api/v1/realtime/tools/web_search",
+            json={"arguments": {"query": "private query"}},
+        )
         authorized = client.post(
             "/api/v1/conversations",
             headers={"Authorization": "Bearer test-token"},
@@ -135,6 +219,8 @@ def test_api_token_protects_http_and_websocket(monkeypatch) -> None:
                 pass
 
     assert unauthorized.status_code == 401
+    assert unauthorized_direct.status_code == 401
+    assert unauthorized_tool.status_code == 401
     assert authorized.status_code == 201
     assert rejected.value.code == 1008
 
@@ -143,8 +229,10 @@ def test_local_account_onboarding_pairing_and_encrypted_key(
     monkeypatch, tmp_path: Path
 ) -> None:
     api_key = "sk-test-this-is-not-a-real-openai-key"
+    issuer = FakeRealtimeSessionIssuer()
 
     with TestClient(app) as client:
+        app.state.openai_realtime_sessions = issuer
         signup = client.post(
             "/studio/v1/auth/signup",
             json={"email": "kuma@example.com", "password": "warm-paws-123"},
@@ -278,6 +366,67 @@ def test_local_account_onboarding_pairing_and_encrypted_key(
         }
         assert api_key not in provider.text
 
+        mcp = FakeMCPGateway(settings, app.state.database, app.state.secret_box)
+        app.state.mcp = mcp
+        connection = client.post(
+            "/studio/v1/mcp/connections",
+            json={
+                "name": "Workspace",
+                "server_url": "https://mcp.example.com/mcp",
+                "auth_type": "none",
+            },
+        )
+        assert connection.status_code == 201
+        connection_id = connection.json()["id"]
+        discovered = client.post(
+            f"/studio/v1/mcp/connections/{connection_id}/discover"
+        )
+        assert discovered.status_code == 200
+        discovered_tool = discovered.json()["tools"][0]
+        assert discovered_tool["enabled"] is False
+        disabled_call = client.post(
+            f"/api/v1/realtime/tools/{discovered_tool['name']}",
+            headers={"Authorization": f"Bearer {device_token}"},
+            json={"arguments": {"query": "launch"}},
+        )
+        assert disabled_call.status_code == 400
+        enabled = client.patch(
+            f"/studio/v1/mcp/connections/{connection_id}/tools/"
+            f"{discovered_tool['id']}",
+            json={"enabled": True, "risk": "read"},
+        )
+        assert enabled.status_code == 200
+
+        direct_session = client.post(
+            "/api/v1/realtime/session",
+            headers={"Authorization": f"Bearer {device_token}"},
+        )
+        assert direct_session.status_code == 200
+        assert api_key not in direct_session.text
+        assert issuer.connector is not None
+        assert issuer.connector.settings.openai_api_key == api_key
+        assert issuer.safety_identifier is not None
+        assert "Marco" in issuer.connector.settings.kuma_system_prompt
+        assert issuer.connector.extra_tools == [
+            {
+                "type": "function",
+                "name": discovered_tool["name"],
+                "description": "Search the connected workspace.",
+                "parameters": discovered_tool["input_schema"],
+            }
+        ]
+
+        tool_result = client.post(
+            f"/api/v1/realtime/tools/{discovered_tool['name']}",
+            headers={"Authorization": f"Bearer {device_token}"},
+            json={"arguments": {"query": "launch"}},
+        )
+        assert tool_result.status_code == 200
+        assert json.loads(tool_result.json()["output"]) == {
+            "matches": ["Launch plan"]
+        }
+        assert mcp.client.calls == [("search_workspace", {"query": "launch"})]
+
         signout = client.post("/studio/v1/auth/signout")
         assert signout.status_code == 204
         assert client.get("/studio/v1/bootstrap").status_code == 401
@@ -296,6 +445,421 @@ def test_local_account_onboarding_pairing_and_encrypted_key(
     assert "warm-paws-123" not in password_hash
     assert device_token not in stored_device_token
     assert SecretBox.from_settings(settings).decrypt(encrypted_key) == api_key
+
+
+def test_studio_settings_manage_password_devices_and_account(
+    monkeypatch, tmp_path: Path
+) -> None:
+    original_password = "warm-paws-123"
+    new_password = "new-warm-paws-456"
+
+    with TestClient(app) as client:
+        signup = client.post(
+            "/studio/v1/auth/signup",
+            json={"email": "settings@example.com", "password": original_password},
+        )
+        assert signup.status_code == 201
+        first_session = client.cookies.get(settings.kuma_session_cookie_name)
+        assert first_session
+
+        second_signin = client.post(
+            "/studio/v1/auth/signin",
+            json={"email": "settings@example.com", "password": original_password},
+        )
+        assert second_signin.status_code == 200
+
+        wrong_password = client.put(
+            "/studio/v1/account/password",
+            json={
+                "current_password": "wrong-password",
+                "new_password": new_password,
+            },
+        )
+        assert wrong_password.status_code == 401
+
+        reused_password = client.put(
+            "/studio/v1/account/password",
+            json={
+                "current_password": original_password,
+                "new_password": original_password,
+            },
+        )
+        assert reused_password.status_code == 422
+
+        changed = client.put(
+            "/studio/v1/account/password",
+            json={
+                "current_password": original_password,
+                "new_password": new_password,
+            },
+        )
+        assert changed.status_code == 204
+        assert client.get("/studio/v1/bootstrap").status_code == 200
+        assert (
+            client.get(
+                "/studio/v1/bootstrap",
+                headers={
+                    "cookie": f"{settings.kuma_session_cookie_name}={first_session}"
+                },
+            ).status_code
+            == 401
+        )
+
+        assert client.post("/studio/v1/auth/signout").status_code == 204
+        assert (
+            client.post(
+                "/studio/v1/auth/signin",
+                json={"email": "settings@example.com", "password": original_password},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                "/studio/v1/auth/signin",
+                json={"email": "settings@example.com", "password": new_password},
+            ).status_code
+            == 200
+        )
+
+        profile = client.put(
+            "/studio/v1/profile",
+            json={
+                "full_name": "Settings Tester",
+                "role": "Personal use",
+                "use_cases": ["personal-assistant"],
+                "technical_comfort": "everyday",
+                "discovery_source": "search",
+                "response_style": "brief",
+            },
+        )
+        assert profile.status_code == 200
+
+        authorization = client.post(
+            "/device/v1/authorizations",
+            json={"device_name": "Test Apple Watch"},
+        ).json()
+        approval = client.post(
+            "/studio/v1/pairings/approve",
+            json={"user_code": authorization["user_code"]},
+        )
+        device_id = approval.json()["device"]["id"]
+        device_token = client.post(
+            "/device/v1/token",
+            json={"device_code": authorization["device_code"]},
+        ).json()["access_token"]
+
+        monkeypatch.setattr(settings, "kuma_require_device_auth", True)
+        assert (
+            client.post(
+                "/api/v1/conversations",
+                headers={"Authorization": f"Bearer {device_token}"},
+            ).status_code
+            == 201
+        )
+        assert client.delete("/studio/v1/devices/not-this-watch").status_code == 404
+
+        revoked = client.delete(f"/studio/v1/devices/{device_id}")
+        assert revoked.status_code == 200
+        assert revoked.json()["devices"] == []
+        assert revoked.json()["next_step"] == "watch"
+        assert (
+            client.post(
+                "/api/v1/conversations",
+                headers={"Authorization": f"Bearer {device_token}"},
+            ).status_code
+            == 401
+        )
+
+        mcp_connection = client.post(
+            "/studio/v1/mcp/connections",
+            json={
+                "name": "Workspace",
+                "server_url": "https://mcp.example.com/mcp",
+                "auth_type": "none",
+            },
+        )
+        assert mcp_connection.status_code == 201
+
+        wrong_delete = client.request(
+            "DELETE",
+            "/studio/v1/account",
+            json={"current_password": original_password},
+        )
+        assert wrong_delete.status_code == 401
+
+        deleted = client.request(
+            "DELETE",
+            "/studio/v1/account",
+            json={"current_password": new_password},
+        )
+        assert deleted.status_code == 204
+        assert client.get("/studio/v1/bootstrap").status_code == 401
+        assert (
+            client.post(
+                "/studio/v1/auth/signin",
+                json={"email": "settings@example.com", "password": new_password},
+            ).status_code
+            == 401
+        )
+
+    database = sqlite3.connect(tmp_path / "kuma-test.db")
+    remaining = {
+        table: database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in (
+            "users",
+            "user_profiles",
+            "studio_sessions",
+            "devices",
+            "device_authorizations",
+            "mcp_connections",
+            "mcp_tools",
+            "mcp_oauth_flows",
+        )
+    }
+    database.close()
+    assert remaining == {
+        "users": 0,
+        "user_profiles": 0,
+        "studio_sessions": 0,
+        "devices": 0,
+        "device_authorizations": 0,
+        "mcp_connections": 0,
+        "mcp_tools": 0,
+        "mcp_oauth_flows": 0,
+    }
+
+
+def test_mcp_oauth_flow_uses_pkce_and_encrypts_tokens(monkeypatch, tmp_path: Path) -> None:
+    async def discover_oauth(server_url: str, request):
+        assert server_url == "https://mcp.example.com/mcp"
+        return (
+            ProtectedResourceMetadata(
+                resource="https://mcp.example.com/mcp",
+                authorization_servers=["https://auth.example.com"],
+                scopes_supported=["workspace:read"],
+            ),
+            OAuthMetadata(
+                issuer="https://auth.example.com",
+                authorization_endpoint="https://auth.example.com/authorize",
+                token_endpoint="https://auth.example.com/token",
+                scopes_supported=["workspace:read", "offline_access"],
+                authorization_response_iss_parameter_supported=True,
+            ),
+        )
+
+    class FakeOAuthHTTPClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def post(self, url: str, *, data: dict, headers: dict):
+            assert url == "https://auth.example.com/token"
+            assert data["resource"] == "https://mcp.example.com/mcp"
+            assert data["client_id"] == "kuma-test-client"
+            assert data["client_secret"] == "client-secret-value"
+            assert len(data["code_verifier"]) >= 43
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "oauth-access-token",
+                    "refresh_token": "oauth-refresh-token",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "workspace:read offline_access",
+                },
+            )
+
+    monkeypatch.setattr(mcp_routes, "_discover_oauth", discover_oauth)
+
+    with TestClient(app) as client:
+        signup = client.post(
+            "/studio/v1/auth/signup",
+            json={"email": "oauth@example.com", "password": "warm-paws-123"},
+        )
+        assert signup.status_code == 201
+        created = client.post(
+            "/studio/v1/mcp/connections",
+            json={
+                "name": "OAuth workspace",
+                "server_url": "https://mcp.example.com/mcp",
+                "auth_type": "oauth",
+                "oauth_client_id": "kuma-test-client",
+                "oauth_client_secret": "client-secret-value",
+                "oauth_token_endpoint_auth_method": "client_secret_post",
+            },
+        )
+        assert created.status_code == 201
+        assert "client-secret-value" not in created.text
+        connection_id = created.json()["id"]
+
+        started = client.post(
+            f"/studio/v1/mcp/connections/{connection_id}/oauth/start"
+        )
+        assert started.status_code == 200
+        authorization_url = urlparse(started.json()["authorization_url"])
+        parameters = parse_qs(authorization_url.query)
+        assert parameters["resource"] == ["https://mcp.example.com/mcp"]
+        assert parameters["scope"] == ["workspace:read offline_access"]
+        assert parameters["code_challenge_method"] == ["S256"]
+        assert len(parameters["code_challenge"][0]) >= 43
+        state_value = parameters["state"][0]
+
+        monkeypatch.setattr(mcp_routes.httpx, "AsyncClient", FakeOAuthHTTPClient)
+        callback = client.get(
+            "/studio/v1/mcp/oauth/callback",
+            params={
+                "code": "authorization-code",
+                "state": state_value,
+                "iss": "https://auth.example.com",
+            },
+            follow_redirects=False,
+        )
+        assert callback.status_code == 303
+        assert callback.headers["location"].endswith(
+            "/studio/settings?mcp=connected"
+        )
+
+    database = sqlite3.connect(tmp_path / "kuma-test.db")
+    encrypted = database.execute(
+        "SELECT encrypted_credentials FROM mcp_connections WHERE id = ?",
+        (connection_id,),
+    ).fetchone()[0]
+    database.close()
+    assert "client-secret-value" not in encrypted
+    assert "oauth-access-token" not in encrypted
+    decrypted = SecretBox.from_settings(settings).decrypt(encrypted)
+    assert "oauth-access-token" in decrypted
+    assert "oauth-refresh-token" in decrypted
+
+
+def test_mcp_oauth_registers_dynamically_without_client_id(monkeypatch) -> None:
+    async def discover_oauth(server_url: str, request):
+        assert server_url == "https://mcp.example.com/mcp"
+        return (
+            ProtectedResourceMetadata(
+                resource="https://mcp.example.com/mcp",
+                authorization_servers=["https://auth.example.com"],
+                scopes_supported=["workspace:read"],
+            ),
+            OAuthMetadata(
+                issuer="https://auth.example.com",
+                authorization_endpoint="https://auth.example.com/authorize",
+                token_endpoint="https://auth.example.com/token",
+                registration_endpoint="https://auth.example.com/register",
+                scopes_supported=["workspace:read", "offline_access"],
+            ),
+        )
+
+    class FakeRegisterClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def post(self, url: str, *, json=None, data=None, headers=None):
+            assert url == "https://auth.example.com/register"
+            assert json["token_endpoint_auth_method"] == "none"
+            assert json["application_type"] == "native"
+            return httpx.Response(
+                201,
+                json={
+                    "client_id": "dyn-kuma",
+                    "token_endpoint_auth_method": "none",
+                    "redirect_uris": json["redirect_uris"],
+                },
+            )
+
+    monkeypatch.setattr(mcp_routes, "_discover_oauth", discover_oauth)
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(mcp_routes.httpx, "AsyncClient", FakeRegisterClient)
+        signup = client.post(
+            "/studio/v1/auth/signup",
+            json={"email": "dcr@example.com", "password": "warm-paws-123"},
+        )
+        assert signup.status_code == 201
+        created = client.post(
+            "/studio/v1/mcp/connections",
+            json={
+                "name": "OAuth workspace",
+                "server_url": "https://mcp.example.com/mcp",
+                "auth_type": "oauth",
+            },
+        )
+        assert created.status_code == 201
+        started = client.post(
+            f"/studio/v1/mcp/connections/{created.json()['id']}/oauth/start"
+        )
+
+    assert started.status_code == 200
+    parameters = parse_qs(urlparse(started.json()["authorization_url"]).query)
+    assert parameters["client_id"] == ["dyn-kuma"]
+    assert parameters["code_challenge_method"] == ["S256"]
+
+
+def test_mcp_compacts_oversized_tool_catalog_results() -> None:
+    items = [
+        {
+            "name": f"tool_{index}",
+            "title": f"Tool {index}",
+            "description": "x" * 4000,
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+            "annotations": {"readOnlyHint": True},
+        }
+        for index in range(30)
+    ]
+    result = SimpleNamespace(
+        structured_content=None,
+        content=[SimpleNamespace(type="text", text=json.dumps(items))],
+        is_error=False,
+    )
+
+    output = MCPGateway._serialize_result(result)
+    parsed = json.loads(output)
+
+    assert len(json.dumps(items).encode("utf-8")) > MAX_TOOL_RESULT_BYTES
+    assert len(output.encode("utf-8")) <= MAX_TOOL_RESULT_BYTES
+    assert parsed[0]["name"] == "tool_0"
+    assert parsed[0]["title"] == "Tool 0"
+    assert "inputSchema" not in parsed[0]
+    assert "annotations" not in parsed[0]
+    assert len(parsed[0]["description"]) <= 240
+
+
+def test_mcp_truncates_oversized_text_results() -> None:
+    result = SimpleNamespace(
+        structured_content=None,
+        content=[
+            SimpleNamespace(type="text", text="n" * (MAX_TOOL_RESULT_BYTES + 2048))
+        ],
+        is_error=False,
+    )
+
+    output = MCPGateway._serialize_result(result)
+
+    assert len(output.encode("utf-8")) <= MAX_TOOL_RESULT_BYTES
+    assert output.startswith("nnn")
+    assert "[truncated from" in output
+
+
+def test_mcp_rejects_private_urls_outside_local() -> None:
+    production = Settings(_env_file=None, kuma_environment="production")
+    with pytest.raises(MCPGatewayError, match="HTTPS"):
+        validate_mcp_url("http://127.0.0.1:9/mcp", production)
+    with pytest.raises(MCPGatewayError, match="Private"):
+        asyncio.run(validate_mcp_destination("https://127.0.0.1/mcp", production))
 
 
 def test_full_voice_turn() -> None:
@@ -395,6 +959,119 @@ def test_realtime_session_uses_watch_pcm_format() -> None:
     assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 24_000}
     assert audio["output"]["format"] == {"type": "audio/pcm", "rate": 24_000}
     assert "tools" not in connector.session_update()["session"]
+
+
+def test_direct_realtime_session_returns_only_short_lived_credentials(
+    monkeypatch,
+) -> None:
+    issuer = FakeRealtimeSessionIssuer()
+    monkeypatch.setattr(settings, "openai_api_key", "server-secret-never-returned")
+    monkeypatch.setattr(settings, "kuma_direct_realtime", True)
+
+    with TestClient(app) as client:
+        app.state.openai_realtime = OpenAIRealtimeConnector(settings)
+        app.state.openai_realtime_sessions = issuer
+        response = client.post("/api/v1/realtime/session")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "url": (
+            "wss://api.openai.com/v1/realtime?model="
+            "gpt-realtime-2.1-mini"
+        ),
+        "client_secret": "ek_test_short_lived",
+        "expires_at": 1_800_000_000,
+        "session_id": "sess_test",
+        "audio_format": "pcm16",
+        "sample_rate": 24_000,
+        "channels": 1,
+    }
+    assert "server-secret-never-returned" not in response.text
+    assert issuer.connector is not None
+    assert issuer.connector.session_configuration(include_model=True)["model"] == (
+        "gpt-realtime-2.1-mini"
+    )
+    assert issuer.safety_identifier is None
+
+
+def test_direct_realtime_session_can_be_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "kuma_direct_realtime", False)
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/realtime/session")
+
+    assert response.status_code == 404
+
+
+def test_realtime_session_issuer_sends_configured_session() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["authorization"] = request.headers.get("authorization")
+        captured["safety_identifier"] = request.headers.get(
+            "openai-safety-identifier"
+        )
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "value": "ek_test",
+                "expires_at": 1_800_000_000,
+                "session": {"id": "sess_test"},
+            },
+        )
+
+    configured = Settings(
+        _env_file=None,
+        openai_api_key="standard-secret",
+        exa_api_key="exa-test",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    issuer = OpenAIRealtimeSessionIssuer(configured, client=client)
+    async def issue() -> dict:
+        result = await issuer.issue(
+            OpenAIRealtimeConnector(configured),
+            safety_identifier="kuma_user_hash",
+        )
+        await client.aclose()
+        return result
+
+    issued = asyncio.run(issue())
+
+    assert issued == {
+        "value": "ek_test",
+        "expires_at": 1_800_000_000,
+        "session_id": "sess_test",
+    }
+    assert captured["authorization"] == "Bearer standard-secret"
+    assert captured["safety_identifier"] == "kuma_user_hash"
+    assert captured["body"]["session"]["model"] == "gpt-realtime-2.1-mini"
+    assert captured["body"]["session"]["audio"]["input"]["format"] == {
+        "type": "audio/pcm",
+        "rate": 24_000,
+    }
+    assert captured["body"]["session"]["tools"] == [WEB_SEARCH_TOOL]
+
+
+def test_direct_realtime_tool_relay_is_allowlisted() -> None:
+    search = FakeExa()
+
+    with TestClient(app) as client:
+        app.state.tools = ToolRegistry(search=search)
+        success = client.post(
+            "/api/v1/realtime/tools/web_search",
+            json={"arguments": {"query": "weather in milan"}},
+        )
+        rejected = client.post(
+            "/api/v1/realtime/tools/not_a_tool",
+            json={"arguments": {}},
+        )
+
+    assert success.status_code == 200
+    assert json.loads(success.json()["output"])["results"][0]["title"] == "Weather"
+    assert search.queries == ["weather in milan"]
+    assert rejected.status_code == 400
+    assert rejected.json() == {"detail": "Unknown tool: 'not_a_tool'"}
 
 
 def test_realtime_cancel_interrupts_response() -> None:

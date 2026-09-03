@@ -6,13 +6,16 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .config import Settings
 from .models import (
     Device,
     DeviceAuthorization,
+    MCPConnection,
+    MCPOAuthFlow,
+    MCPTool,
     ProviderSecret,
     StudioSession,
     User,
@@ -41,6 +44,15 @@ device_router = APIRouter(prefix="/device/v1", tags=["device pairing"])
 class AuthInput(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=128)
+
+
+class PasswordChangeInput(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class AccountDeleteInput(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
 
 
 class ProfileInput(BaseModel):
@@ -178,6 +190,14 @@ def _set_session_cookie(response: Response, settings: Settings, token: str) -> N
     )
 
 
+def _delete_session_cookie(response: Response, settings: Settings) -> None:
+    response.delete_cookie(
+        settings.kuma_session_cookie_name,
+        path="/",
+        domain=settings.kuma_session_cookie_domain.strip() or None,
+    )
+
+
 async def _create_studio_session(
     session: AsyncSession, settings: Settings, user_id: str
 ) -> str:
@@ -197,6 +217,7 @@ def _user_payload(user: User) -> dict[str, object]:
     return {
         "id": user.id,
         "email": user.email,
+        "created_at": user.created_at.isoformat(),
     }
 
 
@@ -316,11 +337,66 @@ async def signout(
     await session.delete(identity.session)
     await session.commit()
     settings = settings_from(request)
-    response.delete_cookie(
-        settings.kuma_session_cookie_name,
-        path="/",
-        domain=settings.kuma_session_cookie_domain.strip() or None,
+    _delete_session_cookie(response, settings)
+    response.status_code = status.HTTP_204_NO_CONTENT
+    return response
+
+
+@studio_router.put("/account/password", status_code=204)
+async def change_password(
+    body: PasswordChangeInput,
+    identity: StudioIdentity = Depends(require_studio_identity),
+    session: AsyncSession = Depends(database_session),
+) -> Response:
+    if not verify_password(body.current_password, identity.user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if body.current_password == body.new_password:
+        raise HTTPException(status_code=422, detail="Choose a different password")
+
+    try:
+        identity.user.password_hash = hash_password(body.new_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    await session.execute(
+        delete(StudioSession).where(
+            StudioSession.user_id == identity.user.id,
+            StudioSession.id != identity.session.id,
+        )
     )
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@studio_router.delete("/account", status_code=204)
+async def delete_account(
+    body: AccountDeleteInput,
+    response: Response,
+    request: Request,
+    identity: StudioIdentity = Depends(require_studio_identity),
+    session: AsyncSession = Depends(database_session),
+) -> Response:
+    if not verify_password(body.current_password, identity.user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    user_id = identity.user.id
+    connection_ids = select(MCPConnection.id).where(MCPConnection.user_id == user_id)
+    await session.execute(
+        delete(MCPTool).where(MCPTool.connection_id.in_(connection_ids))
+    )
+    await session.execute(delete(MCPOAuthFlow).where(MCPOAuthFlow.user_id == user_id))
+    await session.execute(delete(MCPConnection).where(MCPConnection.user_id == user_id))
+    await session.execute(
+        delete(DeviceAuthorization).where(DeviceAuthorization.user_id == user_id)
+    )
+    await session.execute(delete(ProviderSecret).where(ProviderSecret.user_id == user_id))
+    await session.execute(delete(Device).where(Device.user_id == user_id))
+    await session.execute(delete(StudioSession).where(StudioSession.user_id == user_id))
+    await session.execute(delete(UserProfile).where(UserProfile.user_id == user_id))
+    await session.execute(delete(User).where(User.id == user_id))
+    await session.commit()
+
+    _delete_session_cookie(response, settings_from(request))
     response.status_code = status.HTTP_204_NO_CONTENT
     return response
 
@@ -403,6 +479,27 @@ async def approve_pairing(
         await session.commit()
 
     return {"device": _device_payload(device), "status": "approved"}
+
+
+@studio_router.delete("/devices/{device_id}")
+async def revoke_device(
+    device_id: str,
+    identity: StudioIdentity = Depends(require_studio_identity),
+    session: AsyncSession = Depends(database_session),
+) -> dict[str, object]:
+    device = await session.scalar(
+        select(Device).where(
+            Device.id == device_id,
+            Device.user_id == identity.user.id,
+            Device.revoked_at.is_(None),
+        )
+    )
+    if device is None:
+        raise HTTPException(status_code=404, detail="That Watch is not paired")
+
+    device.revoked_at = utcnow()
+    await session.commit()
+    return await _bootstrap_payload(session, identity.user)
 
 
 @studio_router.put("/providers/openai")

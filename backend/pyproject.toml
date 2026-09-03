@@ -9,6 +9,7 @@ dependencies = [
     "cryptography>=45,<47",
     "fastapi>=0.116,<1",
     "httpx>=0.28,<1",
+    "mcp>=2,<3",
     "pwdlib[argon2]>=0.2,<1",
     "pydantic-settings>=2.10,<3",
     "python-multipart>=0.0.20,<1",

@@ -150,6 +150,7 @@ private enum ChatTheme {
 
 struct ContentView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel = VoiceConversationViewModel()
     @State private var confirmResetConversation = false
 
@@ -167,6 +168,14 @@ struct ContentView: View {
             bottomBar
         }
         .preferredColorScheme(.dark)
+        .task(id: viewModel.messages.isEmpty) {
+            guard viewModel.messages.isEmpty else { return }
+            viewModel.prepareHomeSession()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active, viewModel.messages.isEmpty else { return }
+            viewModel.prepareHomeSession()
+        }
         .confirmationDialog(
             "Are you sure you want to delete the conversation?",
             isPresented: $confirmResetConversation,

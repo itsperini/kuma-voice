@@ -1,6 +1,7 @@
 export type StudioUser = {
   id: string;
   email: string;
+  created_at: string;
 };
 
 export type StudioProfile = {
@@ -30,6 +31,28 @@ export type StudioBootstrap = {
     last_four: string | null;
   };
   next_step: "profile" | "watch" | "provider" | "complete";
+};
+
+export type MCPTool = {
+  id: string;
+  remote_name: string;
+  name: string;
+  title: string | null;
+  description: string | null;
+  enabled: boolean;
+  risk: "read" | "write";
+};
+
+export type MCPConnection = {
+  id: string;
+  name: string;
+  server_url: string;
+  auth_type: "none" | "bearer" | "oauth";
+  enabled: boolean;
+  status: string;
+  last_error: string | null;
+  catalog_expires_at: string | null;
+  tools: MCPTool[];
 };
 
 export class StudioApiError extends Error {

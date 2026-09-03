@@ -1,6 +1,7 @@
 "use client";
 
 import Image from "next/image";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, MotionConfig, motion } from "motion/react";
@@ -284,6 +285,7 @@ export function StudioOnboarding() {
         </div>
         <div className="studio-account">
           <span className="studio-account-email">{data?.user.email}</span>
+          <Link href="/studio/settings">Settings</Link>
           <button type="button" onClick={signOut}>Sign out</button>
         </div>
       </header>

@@ -4,11 +4,13 @@
   <img src="assets/watchos-header-banner.png" alt="Kuma Voice watchOS assistant" width="80%">
 </p>
 
-Kuma Voice is a watch-only voice assistant with a local-first Studio. The Watch
-streams microphone audio to a FastAPI backend, which keeps provider credentials
-off the device and streams a spoken answer back. The Next.js Studio handles
-accounts, onboarding, Watch pairing, and provider setup. Optional tools add web
-search, Notion notes, and Google Calendar access.
+Kuma Voice is a watch-only voice assistant with a local-first Studio. FastAPI
+authenticates the Watch and creates a short-lived OpenAI Realtime session; the
+Watch then streams audio directly to OpenAI without receiving the user's
+long-lived provider key. FastAPI still executes allowlisted tools and remains an
+automatic streaming fallback. The Next.js Studio handles accounts, onboarding,
+Watch pairing, and provider setup. Optional tools add web search, Notion notes,
+and Google Calendar access.
 
 This repository does not include a public backend or any credentials. Run your
 own server and point the Watch app at it.
@@ -131,6 +133,43 @@ Set `NEXT_PUBLIC_STUDIO_ORIGIN=https://studio.kumavoice.com` in Next.js,
 `KUMA_STUDIO_URL=https://studio.kumavoice.com` in FastAPI. The Studio already
 supports host-based routing for the dedicated subdomain.
 
+Direct Realtime is enabled by default. Set `KUMA_DIRECT_REALTIME=false` to keep
+all audio on the existing Watch → FastAPI → OpenAI WebSocket path. With the
+default enabled, FastAPI mints a short-lived OpenAI client secret and returns it
+only to an authenticated Watch. Tool calls still return to the authenticated
+FastAPI API, where the fixed server-side allowlist is enforced. If the direct
+session cannot be established, the Watch falls back to the existing proxy.
+
+## MCP servers
+
+Kuma acts as the MCP client and host. The Watch never receives connector
+credentials and does not speak MCP: OpenAI emits a function call, the Watch
+relays it to its authenticated FastAPI backend, and FastAPI calls the selected
+MCP server for that user. The proxy realtime path uses the same executor.
+
+This first version uses the MCP `2026-07-28` stateless core over Streamable
+HTTP. It deliberately does not support local `stdio` servers or the deprecated
+standalone SSE transport. Add a connection in Studio Settings, discover
+its catalog, and explicitly enable individual tools. Newly discovered tools
+remain disabled by default.
+
+Connections may be unauthenticated, use an encrypted bearer token, or use OAuth
+2.1 with authorization-server discovery, PKCE, resource indicators, issuer
+validation, encrypted token storage, and refresh tokens. Studio prefers a
+redirect sign-in: it uses a client ID metadata document when the server
+advertises CIMD, otherwise it registers dynamically at the authorization
+server's `registration_endpoint`. Enter a client ID only if that server does
+not support either.
+
+For hosted OAuth, set:
+
+- `KUMA_MCP_OAUTH_CALLBACK_URL=https://api.kumavoice.com/studio/v1/mcp/oauth/callback`
+- `KUMA_MCP_CLIENT_METADATA_URL=https://api.kumavoice.com/.well-known/oauth-client/kumavoice.json`
+
+Both URLs must exactly match the public deployment. Production MCP and OAuth
+URLs must use HTTPS and resolve to public addresses. Connector secrets and
+tokens are encrypted with `KUMA_ENCRYPTION_KEY`.
+
 ## Deploy to Fly.io
 
 The included `fly.toml` deliberately contains no app name or personal region.
@@ -180,8 +219,10 @@ the prototype.
 
 Microphone audio and conversation content are sent to the providers configured
 on your backend. Web searches, notes, and calendar requests may also be sent to
-their respective services. Review those providers' retention settings before
-using personal or sensitive data.
+their respective services. Tool arguments, relevant conversation context, and
+tool results may be processed by each MCP server a user enables. Review those
+providers' permissions, privacy terms, and retention settings before using
+personal or sensitive data.
 
 Never commit `backend/.env` or `watchos/Local.xcconfig`. If a credential is ever
 exposed, rotate it rather than merely deleting it from Git.
@@ -195,8 +236,14 @@ exposed, rotate it rather than merely deleting it from Git.
 - `PUT /studio/v1/profile` — atomically create or replace all required onboarding answers
 - `POST /studio/v1/pairings/approve` — bind a Watch code to the account
 - `POST /studio/v1/providers/openai` — encrypt and store an OpenAI key
+- `GET|POST /studio/v1/mcp/connections` — list or add remote MCP servers
+- `POST /studio/v1/mcp/connections/{id}/oauth/start` — begin OAuth with PKCE
+- `POST /studio/v1/mcp/connections/{id}/discover` — refresh a tool catalog
+- `PATCH /studio/v1/mcp/connections/{id}/tools/{tool_id}` — allowlist a tool
 - `POST /device/v1/authorizations` — request a Watch pairing code
 - `POST /device/v1/token` — poll for the paired device credential
+- `POST /api/v1/realtime/session` — mint a short-lived direct Realtime session
+- `POST /api/v1/realtime/tools/{name}` — execute one allowlisted Realtime tool
 - `WS /api/v1/realtime` — realtime PCM voice conversation
 - `POST /api/v1/transcriptions` — audio file to text
 - `POST /api/v1/responses` — messages to assistant text

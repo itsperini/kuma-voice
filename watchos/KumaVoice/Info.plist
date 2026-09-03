@@ -23,7 +23,9 @@
 	<key>KUMA_BACKEND_URL</key>
 	<string>$(KUMA_BACKEND_URL)</string>
 	<key>KUMA_API_TOKEN</key>
-	<string>$(KUMA_API_TOKEN)</string>
+	<string>$(KUMA_EFFECTIVE_API_TOKEN)</string>
+	<key>KUMA_USE_CONFIGURED_API_TOKEN</key>
+	<string>$(KUMA_USE_CONFIGURED_API_TOKEN)</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>

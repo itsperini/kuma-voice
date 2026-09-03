@@ -1,8 +1,11 @@
 import base64
+import hashlib
 import hmac
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import (
     FastAPI,
@@ -17,6 +20,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketState
 from websockets.exceptions import ConnectionClosed
 
@@ -25,10 +29,14 @@ from .config import Settings, get_settings
 from .conversations import ConversationNotFoundError, ConversationStore
 from .database import open_database
 from .exa import ExaClient
+from .mcp_gateway import MCPGateway, MCPGatewayError, UserToolExecutor
+from .mcp_routes import mcp_metadata_router, mcp_router
 from .notion import NotionClient
 from .openai_realtime import (
     OpenAIRealtimeConnector,
+    OpenAIRealtimeSessionIssuer,
     RealtimeProtocolError,
+    RealtimeSessionError,
     bridge_realtime_session,
 )
 from .openrouter import OpenRouterClient, OpenRouterError
@@ -65,14 +73,17 @@ async def lifespan(app: FastAPI):
     app.state.database = database
     app.state.openrouter = OpenRouterClient(settings)
     app.state.openai_realtime = OpenAIRealtimeConnector(settings)
+    app.state.openai_realtime_sessions = OpenAIRealtimeSessionIssuer(settings)
     app.state.tools = ToolRegistry(
         search=ExaClient(settings) if settings.web_search_api_key else None,
         notion=NotionClient(settings) if settings.notion_api_key.strip() else None,
         calendar=GoogleCalendarClient(settings) if settings.calendar_configured else None,
     )
     app.state.exa = app.state.tools.search
+    app.state.mcp = MCPGateway(settings, database, app.state.secret_box)
     yield
     await app.state.openrouter.aclose()
+    await app.state.openai_realtime_sessions.aclose()
     await app.state.tools.aclose()
     await app.state.database_engine.dispose()
 
@@ -85,6 +96,8 @@ app = FastAPI(
 )
 app.include_router(studio_router)
 app.include_router(device_router)
+app.include_router(mcp_router)
+app.include_router(mcp_metadata_router)
 
 
 def api_token_matches(authorization: str | None) -> bool:
@@ -164,9 +177,113 @@ async def read_audio(upload: UploadFile) -> tuple[bytes, str]:
     return audio, audio_format
 
 
+class RealtimeToolRequest(BaseModel):
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+async def realtime_connector_for(
+    application: FastAPI,
+    principal: DevicePrincipal | None,
+) -> OpenAIRealtimeConnector:
+    if principal is None:
+        return application.state.openai_realtime
+
+    runtime = await load_device_runtime(
+        application.state.database,
+        application.state.secret_box,
+        principal.user_id,
+    )
+    personalized_prompt = settings.kuma_system_prompt.rstrip()
+    if runtime.full_name:
+        personalized_prompt += f" The user's name is {runtime.full_name}."
+    style_instructions = {
+        "brief": " Prefer short spoken answers.",
+        "balanced": " Give enough spoken context to be useful without rambling.",
+        "detailed": " Give a more complete answer when the request benefits from it.",
+    }
+    personalized_prompt += style_instructions.get(runtime.response_style, "")
+    mcp_tools = await application.state.mcp.openai_tools(principal.user_id)
+    return OpenAIRealtimeConnector(
+        settings.model_copy(
+            update={
+                "openai_api_key": runtime.openai_api_key or "",
+                "kuma_system_prompt": personalized_prompt,
+            }
+        ),
+        extra_tools=mcp_tools,
+    )
+
+
+def realtime_tools_for(
+    application: FastAPI,
+    principal: DevicePrincipal | None,
+) -> UserToolExecutor:
+    return UserToolExecutor(
+        application.state.tools,
+        application.state.mcp,
+        principal.user_id if principal is not None else None,
+    )
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse()
+
+
+@app.post("/api/v1/realtime/session")
+async def create_realtime_session(request: Request) -> dict[str, Any]:
+    if not settings.kuma_direct_realtime:
+        raise HTTPException(status_code=404, detail="Direct realtime is disabled")
+
+    principal = getattr(request.state, "device_principal", None)
+    connector = await realtime_connector_for(request.app, principal)
+    safety_identifier = None
+    if principal is not None:
+        digest = hashlib.sha256(f"user:{principal.user_id}".encode()).hexdigest()
+        safety_identifier = f"kuma_{digest[:32]}"
+
+    try:
+        issued = await request.app.state.openai_realtime_sessions.issue(
+            connector,
+            safety_identifier=safety_identifier,
+        )
+    except RealtimeSessionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    query = urlencode({"model": connector.settings.openai_realtime_model})
+    return {
+        "url": f"{connector.settings.openai_realtime_url}?{query}",
+        "client_secret": issued["value"],
+        "expires_at": issued["expires_at"],
+        "session_id": issued["session_id"],
+        "audio_format": "pcm16",
+        "sample_rate": 24_000,
+        "channels": 1,
+    }
+
+
+@app.post("/api/v1/realtime/tools/{tool_name}")
+async def execute_realtime_tool(
+    request: Request,
+    tool_name: str,
+    body: RealtimeToolRequest,
+) -> dict[str, str]:
+    argument_bytes = len(
+        json.dumps(body.arguments, separators=(",", ":")).encode("utf-8")
+    )
+    if argument_bytes > 64 * 1024:
+        raise HTTPException(status_code=413, detail="Tool arguments are too large")
+
+    try:
+        principal = getattr(request.state, "device_principal", None)
+        output = await realtime_tools_for(request.app, principal).run(
+            tool_name, body.arguments
+        )
+    except (RuntimeError, MCPGatewayError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="The tool request failed") from exc
+    return {"output": output}
 
 
 @app.websocket("/api/v1/realtime")
@@ -179,30 +296,7 @@ async def realtime_voice(websocket: WebSocket) -> None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    connector = websocket.app.state.openai_realtime
-    if principal is not None:
-        runtime = await load_device_runtime(
-            websocket.app.state.database,
-            websocket.app.state.secret_box,
-            principal.user_id,
-        )
-        personalized_prompt = settings.kuma_system_prompt.rstrip()
-        if runtime.full_name:
-            personalized_prompt += f" The user's name is {runtime.full_name}."
-        style_instructions = {
-            "brief": " Prefer short spoken answers.",
-            "balanced": " Give enough spoken context to be useful without rambling.",
-            "detailed": " Give a more complete answer when the request benefits from it.",
-        }
-        personalized_prompt += style_instructions.get(runtime.response_style, "")
-        connector = OpenAIRealtimeConnector(
-            settings.model_copy(
-                update={
-                    "openai_api_key": runtime.openai_api_key or "",
-                    "kuma_system_prompt": personalized_prompt,
-                }
-            )
-        )
+    connector = await realtime_connector_for(websocket.app, principal)
 
     await websocket.accept()
     try:
@@ -210,7 +304,7 @@ async def realtime_voice(websocket: WebSocket) -> None:
             websocket,
             connector,
             settings.kuma_max_audio_bytes,
-            tools=getattr(websocket.app.state, "tools", None),
+            tools=realtime_tools_for(websocket.app, principal),
             search=getattr(websocket.app.state, "exa", None),
         )
     except WebSocketDisconnect:

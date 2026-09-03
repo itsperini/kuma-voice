@@ -1,3 +1,4 @@
 // Copy this file to Local.xcconfig and replace the values for your deployment.
 KUMA_BACKEND_URL = https:/$()/your-app-name.fly.dev
 KUMA_API_TOKEN = replace-with-the-same-random-token-used-by-the-backend
+KUMA_USE_CONFIGURED_API_TOKEN = YES

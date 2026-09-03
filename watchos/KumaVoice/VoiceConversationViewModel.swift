@@ -41,6 +41,7 @@ final class VoiceConversationViewModel: ObservableObject {
     private var responsePlaybackPrepared = false
     private var acceptingAssistantOutput = false
     private var actionID = 0
+    private var homeSessionTask: Task<Void, Never>?
 
     init() {
         audio.didFinishPlayback = { [weak self] in
@@ -54,6 +55,53 @@ final class VoiceConversationViewModel: ObservableObject {
                 self?.inputLevel = level
             }
         }
+    }
+
+    /// Remints the realtime session so Studio-enabled MCP tools are current.
+    /// Call when the empty tap-to-talk home appears (launch, pairing, delete).
+    func prepareHomeSession() {
+        guard messages.isEmpty else { return }
+        switch state {
+        case .ready, .failed:
+            break
+        case .connecting, .listening, .sending, .speaking:
+            return
+        }
+
+        homeSessionTask?.cancel()
+        let action = actionID
+        homeSessionTask = Task { [weak self] in
+            guard let self else { return }
+            await self.backend.close()
+            guard !Task.isCancelled,
+                  action == self.actionID,
+                  self.messages.isEmpty
+            else {
+                return
+            }
+            do {
+                try await self.backend.connect(
+                    eventHandler: { [weak self] event in
+                        Task { @MainActor in
+                            self?.handle(event)
+                        }
+                    },
+                    forceReconnect: true
+                )
+            } catch {
+                guard !Task.isCancelled else { return }
+                print(
+                    "Kuma Voice home session refresh skipped: "
+                        + error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func awaitHomeSessionPreparation() async {
+        let task = homeSessionTask
+        homeSessionTask = nil
+        await task?.value
     }
 
     var isBusy: Bool {
@@ -105,6 +153,9 @@ final class VoiceConversationViewModel: ObservableObject {
         state = .connecting
         inputLevel = 0
         do {
+            await awaitHomeSessionPreparation()
+            guard action == actionID else { return }
+
             let (stream, streamContinuation) = AsyncStream<Data>.makeStream(
                 // Preserve the complete utterance. Dropping packets while the
                 // Watch network is briefly slow can fall below Realtime's
@@ -326,6 +377,8 @@ final class VoiceConversationViewModel: ObservableObject {
 
     func resetConversation() {
         actionID += 1
+        homeSessionTask?.cancel()
+        homeSessionTask = nil
         acceptingAssistantOutput = false
         assistantMessageID = nil
         responsePlaybackPrepared = false
@@ -334,6 +387,6 @@ final class VoiceConversationViewModel: ObservableObject {
         inputLevel = 0
         messages = []
         state = .ready
-        Task { await backend.close() }
+        prepareHomeSession()
     }
 }

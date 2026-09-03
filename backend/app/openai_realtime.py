@@ -5,6 +5,7 @@ import json
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
+import httpx
 from fastapi import WebSocket
 from websockets.asyncio.client import connect
 
@@ -13,6 +14,10 @@ from .tools import ToolRegistry
 
 
 class RealtimeProtocolError(Exception):
+    pass
+
+
+class RealtimeSessionError(Exception):
     pass
 
 
@@ -155,8 +160,13 @@ CALENDAR_INSTRUCTIONS = (
 
 
 class OpenAIRealtimeConnector:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        extra_tools: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.settings = settings
+        self.extra_tools = list(extra_tools or [])
 
     def connect(self):
         if not self.settings.openai_api_key:
@@ -177,10 +187,15 @@ class OpenAIRealtimeConnector:
             ping_timeout=20,
         )
 
-    def session_update(self) -> dict[str, Any]:
+    def session_configuration(self, *, include_model: bool = False) -> dict[str, Any]:
         instructions = self.settings.kuma_system_prompt.rstrip()
-        tools: list[dict[str, Any]] = []
+        tools: list[dict[str, Any]] = list(self.extra_tools)
         extras: list[str] = []
+        if self.extra_tools:
+            extras.append(
+                "Use the connected MCP tools when they are relevant. "
+                "Only call tools that are available in this session."
+            )
         if self.settings.web_search_api_key:
             tools.append(WEB_SEARCH_TOOL)
             extras.append(WEB_SEARCH_INSTRUCTIONS)
@@ -208,7 +223,75 @@ class OpenAIRealtimeConnector:
         if tools:
             session["tools"] = tools
             session["tool_choice"] = "auto"
-        return {"type": "session.update", "session": session}
+        if include_model:
+            session["model"] = self.settings.openai_realtime_model
+        return session
+
+    def session_update(self) -> dict[str, Any]:
+        return {"type": "session.update", "session": self.session_configuration()}
+
+
+class OpenAIRealtimeSessionIssuer:
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.settings = settings
+        self._owns_client = client is None
+        self.client = client or httpx.AsyncClient(timeout=15)
+
+    async def issue(
+        self,
+        connector: OpenAIRealtimeConnector,
+        *,
+        safety_identifier: str | None = None,
+    ) -> dict[str, Any]:
+        api_key = connector.settings.openai_api_key.strip()
+        if not api_key:
+            raise RealtimeSessionError(
+                "An OpenAI API key is required before starting a voice session."
+            )
+
+        headers = {"Authorization": f"Bearer {api_key}"}
+        if safety_identifier:
+            headers["OpenAI-Safety-Identifier"] = safety_identifier
+
+        try:
+            response = await self.client.post(
+                self.settings.openai_realtime_client_secrets_url,
+                headers=headers,
+                json={
+                    "session": connector.session_configuration(include_model=True),
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise RealtimeSessionError(
+                "OpenAI could not create a realtime session."
+            ) from exc
+
+        value = payload.get("value") if isinstance(payload, dict) else None
+        expires_at = payload.get("expires_at") if isinstance(payload, dict) else None
+        session = payload.get("session") if isinstance(payload, dict) else None
+        if not isinstance(value, str) or not value or not isinstance(
+            expires_at, (int, float)
+        ):
+            raise RealtimeSessionError(
+                "OpenAI returned an invalid realtime session."
+            )
+
+        session_id = session.get("id") if isinstance(session, dict) else None
+        return {
+            "value": value,
+            "expires_at": int(expires_at),
+            "session_id": session_id if isinstance(session_id, str) else None,
+        }
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self.client.aclose()
 
 
 async def bridge_realtime_session(
